@@ -1,5 +1,5 @@
 cover:
-	go test -coverprofile=coverage.out $(shell go list ./... | grep -v -E '(/proto|/mocks|/cmd/staticlint|/cmd/workload)')
+	go test -coverprofile=coverage.out $(shell go list ./... | grep -v -E '(/proto|/mocks|/cmd/staticlint|/cmd/server/main.go)')
 	go tool cover -func=coverage.out
 	go tool cover -html=coverage.out
 
@@ -7,7 +7,7 @@ test:
 	go test -v ./...
 
 build:
-	go build -o gophkeeper ./cmd/gophkeeper/main.go
+	go build -o gophprofile ./cmd/gophprofile/server/main.go
 	./gophkeepertest -test.v -test.run=^TestIteration1$ -binary-path=cmd/gophkeeper/gophkeeper
 
 check:
@@ -22,9 +22,6 @@ fix_check:
 staticlint:
 	go run ./cmd/server ./...
 	go run ./cmd/worker ./...
-
-reset:
-	go run ./cmd/reset
 
 proto:
 	rm -f proto/gophkeeper.pb.go proto/gophkeeper_grpc.pb.go

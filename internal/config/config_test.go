@@ -55,9 +55,9 @@ func TestLoadDoesNotOverrideExistingEnvironment(t *testing.T) {
 	require.Equal(t, "postgres://from-file", cfg.DatabaseURL)
 }
 
-func TestLoadFallsBackToPostgresDSN(t *testing.T) {
+func TestLoadFallsBackToDatabaseDSN(t *testing.T) {
 	chdir(t, t.TempDir())
-	writeDotEnv(t, "POSTGRES_DSN=postgres://fallback\n")
+	writeDotEnv(t, "DATABASE_DSN=postgres://fallback\n")
 	unsetConfigEnv(t)
 
 	cfg := Load()
@@ -115,7 +115,7 @@ func unsetConfigEnv(t *testing.T) {
 		"HTTP_ADDR",
 		"PUBLIC_BASE_URL",
 		"DATABASE_URL",
-		"POSTGRES_DSN",
+		"DATABASE_DSN",
 		"S3_ENDPOINT",
 		"S3_ACCESS_KEY",
 		"S3_SECRET_KEY",
