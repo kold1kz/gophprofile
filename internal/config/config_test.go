@@ -31,7 +31,6 @@ MAX_FILE_SIZE=2048
 	require.Equal(t, ":9090", cfg.HTTPAddr)
 	require.Equal(t, "https://cdn.example.test", cfg.PublicBaseURL)
 	require.Equal(t, "postgres://env:env@localhost:5432/envdb?sslmode=disable", cfg.DatabaseURL)
-	require.Equal(t, cfg.DatabaseURL, cfg.PostgresDSN)
 	require.Equal(t, "minio:9000", cfg.S3Endpoint)
 	require.Equal(t, "access", cfg.S3AccessKey)
 	require.Equal(t, "secret", cfg.S3SecretKey)
@@ -45,7 +44,7 @@ MAX_FILE_SIZE=2048
 
 func TestLoadDoesNotOverrideExistingEnvironment(t *testing.T) {
 	chdir(t, t.TempDir())
-	writeDotEnv(t, "HTTP_ADDR=:9090\nDATABASE_URL=postgres://from-file\n")
+	writeDotEnv(t, requiredEnv()+"HTTP_ADDR=:9090\nDATABASE_URL=postgres://from-file\n")
 	unsetConfigEnv(t)
 	t.Setenv("HTTP_ADDR", ":7070")
 
@@ -57,13 +56,23 @@ func TestLoadDoesNotOverrideExistingEnvironment(t *testing.T) {
 
 func TestLoadFallsBackToDatabaseDSN(t *testing.T) {
 	chdir(t, t.TempDir())
-	writeDotEnv(t, "DATABASE_DSN=postgres://fallback\n")
+	writeDotEnv(t, requiredEnv()+"DATABASE_DSN=postgres://fallback\n")
 	unsetConfigEnv(t)
 
 	cfg := Load()
 
 	require.Equal(t, "postgres://fallback", cfg.DatabaseURL)
-	require.Equal(t, "postgres://fallback", cfg.PostgresDSN)
+}
+
+func TestLoadEReturnsErrorWhenRequiredSecretMissing(t *testing.T) {
+	chdir(t, t.TempDir())
+	writeDotEnv(t, "DATABASE_URL=postgres://db\nS3_ENDPOINT=minio:9000\nS3_ACCESS_KEY=access\n")
+	unsetConfigEnv(t)
+
+	_, err := LoadE()
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "S3_SECRET_KEY")
 }
 
 func TestParseDotEnvLine(t *testing.T) {
@@ -97,6 +106,15 @@ func TestParseDotEnvLine(t *testing.T) {
 func writeDotEnv(t *testing.T, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(filepath.Join(".", ".env"), []byte(content), 0o600))
+}
+
+func requiredEnv() string {
+	return `
+S3_ENDPOINT=minio:9000
+S3_ACCESS_KEY=access
+S3_SECRET_KEY=secret
+RABBITMQ_URL=amqp://user:pass@rabbit:5672/
+`
 }
 
 func chdir(t *testing.T, dir string) {

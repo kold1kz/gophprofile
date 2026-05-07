@@ -265,8 +265,41 @@
             <p>Status: ${avatar.status}</p>
             <p>Size: ${avatar.dimensions?.width || 0}x${avatar.dimensions?.height || 0}</p>
           </div>
+          <button type="button" data-avatar-id="${avatar.id}"
+            class="delete-avatar-btn w-full bg-red-500/20 border border-red-400/50 text-red-100 text-sm font-semibold py-2 px-4 rounded-lg hover:bg-red-500/30 transition-all">
+            Delete
+          </button>
         `;
         galleryGrid.appendChild(item);
+      }
+
+      document.querySelectorAll('.delete-avatar-btn').forEach((button) => {
+        button.addEventListener('click', async function () {
+          await deleteAvatar(this.dataset.avatarId);
+        });
+      });
+    }
+
+    async function deleteAvatar(avatarId) {
+      const userId = currentUserId || document.getElementById('userId').value;
+      if (!userId) {
+        showError('Enter user ID before deleting avatar');
+        return;
+      }
+      try {
+        const response = await fetch(`/api/v1/avatars/${encodeURIComponent(avatarId)}`, {
+          method: 'DELETE',
+          headers: {
+            'X-User-ID': userId
+          }
+        });
+        if (!response.ok) {
+          showError(`Delete request failed: ${response.status} ${response.statusText}`);
+          return;
+        }
+        await loadGallery(userId);
+      } catch (error) {
+        showError(`Delete network error: ${error.message}`);
       }
     }
   </script>

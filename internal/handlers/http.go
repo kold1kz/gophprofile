@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -17,9 +20,20 @@ import (
 
 // AvatarHandler принимает HTTP-запросы и переводит их в вызовы AvatarService.
 type AvatarHandler struct {
-	service     *services.AvatarService
+	service     AvatarService
 	health      HealthChecker
 	maxFileSize int64
+}
+
+// AvatarService описывает методы бизнес-логики, которые нужны HTTP-слою.
+type AvatarService interface {
+	Upload(ctx context.Context, in services.UploadInput) (domain.Avatar, error)
+	Get(ctx context.Context, id string) (domain.Avatar, io.ReadCloser, string, error)
+	GetLatestForUser(ctx context.Context, userID string) (domain.Avatar, io.ReadCloser, string, error)
+	Metadata(ctx context.Context, id string) (domain.Avatar, error)
+	LatestMetadata(ctx context.Context, userID string) (domain.Avatar, error)
+	List(ctx context.Context, userID string) ([]domain.Avatar, error)
+	Delete(ctx context.Context, id, userID string) error
 }
 
 // HealthChecker описывает объект, который умеет проверить состояние зависимостей приложения.
@@ -28,7 +42,7 @@ type HealthChecker interface {
 }
 
 // NewAvatarHandler собирает HTTP-обработчик с сервисом аватаров и health-checker'ом.
-func NewAvatarHandler(service *services.AvatarService, health HealthChecker, maxFileSize int64) *AvatarHandler {
+func NewAvatarHandler(service AvatarService, health HealthChecker, maxFileSize int64) *AvatarHandler {
 	return &AvatarHandler{service: service, health: health, maxFileSize: maxFileSize}
 }
 
@@ -51,6 +65,8 @@ func (h *AvatarHandler) Routes() http.Handler {
 	r.Get("/web/upload", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 	})
+	r.Post("/web/upload", h.webUpload)
+	r.Get("/web/gallery/{user_id}", h.webGallery)
 	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 	return r
 }
@@ -76,7 +92,9 @@ func (h *AvatarHandler) getAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer body.Close()
-	writeImage(w, r, avatar, body, contentType)
+	if err := writeImage(w, r, avatar, body, contentType); err != nil {
+		log.Printf("write avatar image %s: %v", avatar.ID, err)
+	}
 }
 
 func (h *AvatarHandler) getUserAvatar(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +104,9 @@ func (h *AvatarHandler) getUserAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer body.Close()
-	writeImage(w, r, avatar, body, contentType)
+	if err := writeImage(w, r, avatar, body, contentType); err != nil {
+		log.Printf("write latest avatar image %s: %v", avatar.ID, err)
+	}
 }
 
 func (h *AvatarHandler) getMetadata(w http.ResponseWriter, r *http.Request) {
@@ -131,8 +151,13 @@ func (h *AvatarHandler) deleteUserAvatar(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "Forbidden", "You can only delete your own avatars")
 		return
 	}
-	avatar, err := h.service.Metadata(r.Context(), r.URL.Query().Get("avatar_id"))
-	if err == nil && avatar.ID != "" {
+	avatarID := strings.TrimSpace(r.URL.Query().Get("avatar_id"))
+	if avatarID != "" {
+		avatar, err := h.service.Metadata(r.Context(), avatarID)
+		if err != nil {
+			h.writeServiceError(w, err)
+			return
+		}
 		if err := h.service.Delete(r.Context(), avatar.ID, userID); err != nil {
 			h.writeServiceError(w, err)
 			return
@@ -140,12 +165,11 @@ func (h *AvatarHandler) deleteUserAvatar(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	latest, body, _, err := h.service.GetLatestForUser(r.Context(), userID)
+	latest, err := h.service.LatestMetadata(r.Context(), userID)
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
 	}
-	_ = body.Close()
 	if err := h.service.Delete(r.Context(), latest.ID, userID); err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -168,6 +192,27 @@ func (h *AvatarHandler) healthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AvatarHandler) webIndex(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "web/static/index.html")
+}
+
+func (h *AvatarHandler) webUpload(w http.ResponseWriter, r *http.Request) {
+	userID := strings.TrimSpace(r.FormValue("user_id"))
+	if userID == "" {
+		userID = strings.TrimSpace(r.Header.Get("X-User-ID"))
+	}
+	if userID == "" {
+		writeError(w, http.StatusBadRequest, "user_id is required", "")
+		return
+	}
+	avatar, err := h.parseAndUpload(w, r, userID)
+	if err != nil {
+		h.writeServiceError(w, err)
+		return
+	}
+	http.Redirect(w, r, "/web/gallery/"+avatar.UserID, http.StatusFound)
+}
+
+func (h *AvatarHandler) webGallery(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "web/static/index.html")
 }
 
@@ -198,24 +243,36 @@ func (h *AvatarHandler) writeServiceError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "File too large", "max_size": h.maxFileSize})
 	case errors.Is(err, imaging.ErrUnsupportedFormat):
 		writeError(w, http.StatusBadRequest, "Invalid file format", "Supported formats: jpeg, png, webp")
-	case errors.Is(err, services.ErrForbidden):
+	case errors.Is(err, domain.ErrForbidden):
 		writeError(w, http.StatusForbidden, "Forbidden", "You can only delete your own avatars")
-	case errors.Is(err, services.ErrNotFound):
+	case errors.Is(err, domain.ErrNotFound):
 		writeError(w, http.StatusNotFound, "Avatar not found", "")
 	default:
-		writeError(w, http.StatusInternalServerError, "Internal server error", err.Error())
+		log.Printf("internal handler error: %v", err)
+		writeError(w, http.StatusInternalServerError, "Internal server error", "")
 	}
 }
 
-func writeImage(w http.ResponseWriter, r *http.Request, avatar domain.Avatar, body io.Reader, contentType string) {
+func writeImage(w http.ResponseWriter, r *http.Request, avatar domain.Avatar, body io.Reader, contentType string) error {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(data)
+	etag := `"` + hex.EncodeToString(hash[:]) + `"`
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
+	}
 	if contentType == "" {
 		contentType = avatar.MimeType
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "max-age=86400")
-	w.Header().Set("ETag", fmt.Sprintf("%q", avatar.ID))
+	w.Header().Set("ETag", etag)
 	w.Header().Set("Last-Modified", avatar.UpdatedAt.UTC().Format(http.TimeFormat))
-	_, _ = io.Copy(w, body)
+	_, err = w.Write(data)
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, code int, value any) {

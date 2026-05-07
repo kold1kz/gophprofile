@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -11,10 +12,10 @@ import (
 // Config хранит все настройки, которые нужны серверу и воркеру для старта.
 // Значения приходят из .env, переменных окружения или из дефолтов ниже.
 type Config struct {
-	HTTPAddr       string
+	HTTPAddr string
+	// PublicBaseURL задает внешний адрес MinIO для presigned URL, например http://localhost:9000.
 	PublicBaseURL  string
 	DatabaseURL    string
-	PostgresDSN    string
 	S3Endpoint     string
 	S3AccessKey    string
 	S3SecretKey    string
@@ -30,29 +31,55 @@ type Config struct {
 // Load собирает конфигурацию приложения из .env и окружения.
 // DATABASE_URL имеет приоритет, а DATABASE_DSN используется как запасное имя для строки подключения.
 func Load() Config {
+	cfg, err := LoadE()
+	if err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+// LoadE собирает конфигурацию приложения и возвращает ошибку, если не хватает обязательных секретов.
+func LoadE() (Config, error) {
 	loadDotEnv(".env")
 
 	databaseURL := getenv("DATABASE_URL", "")
 	if databaseURL == "" {
-		databaseURL = getenv("DATABASE_DSN", "postgres://root1:root@localhost:5432/gophprofile")
+		databaseURL = getenv("DATABASE_DSN", "")
+	}
+	if databaseURL == "" {
+		return Config{}, fmt.Errorf("DATABASE_URL or DATABASE_DSN is required")
+	}
+
+	s3Endpoint := getenv("S3_ENDPOINT", "")
+	s3AccessKey := getenv("S3_ACCESS_KEY", "")
+	s3SecretKey := getenv("S3_SECRET_KEY", "")
+	rabbitURL := getenv("RABBITMQ_URL", "")
+	for key, value := range map[string]string{
+		"S3_ENDPOINT":   s3Endpoint,
+		"S3_ACCESS_KEY": s3AccessKey,
+		"S3_SECRET_KEY": s3SecretKey,
+		"RABBITMQ_URL":  rabbitURL,
+	} {
+		if value == "" {
+			return Config{}, fmt.Errorf("%s is required", key)
+		}
 	}
 
 	return Config{
 		HTTPAddr:       getenv("HTTP_ADDR", ":8080"),
-		PublicBaseURL:  getenv("PUBLIC_BASE_URL", "http://localhost:8080"),
+		PublicBaseURL:  getenv("PUBLIC_BASE_URL", ""),
 		DatabaseURL:    databaseURL,
-		PostgresDSN:    databaseURL,
-		S3Endpoint:     getenv("S3_ENDPOINT", "localhost:9000"),
-		S3AccessKey:    getenv("S3_ACCESS_KEY", "admin"),
-		S3SecretKey:    getenv("S3_SECRET_KEY", "admin"),
+		S3Endpoint:     s3Endpoint,
+		S3AccessKey:    s3AccessKey,
+		S3SecretKey:    s3SecretKey,
 		S3Bucket:       getenv("S3_BUCKET", "avatars"),
 		S3UseSSL:       getenvBool("S3_USE_SSL", false),
-		RabbitURL:      getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		RabbitURL:      rabbitURL,
 		RabbitExchange: getenv("RABBITMQ_EXCHANGE", "avatars.exchange"),
 		RabbitQueue:    getenv("RABBITMQ_QUEUE", "avatars.worker"),
 		MaxFileSize:    getenvInt64("MAX_FILE_SIZE", 10<<20),
 		ShutdownDelay:  10 * time.Second,
-	}
+	}, nil
 }
 
 func loadDotEnv(path string) {

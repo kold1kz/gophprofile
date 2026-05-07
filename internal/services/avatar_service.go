@@ -3,9 +3,11 @@ package services
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,12 +21,6 @@ import (
 var (
 	// ErrFileTooLarge означает, что загруженный файл превысил лимит из конфигурации.
 	ErrFileTooLarge = errors.New("file too large")
-
-	// ErrForbidden возвращается, когда пользователь пытается изменить чужой аватар.
-	ErrForbidden = errors.New("forbidden")
-
-	// ErrNotFound означает, что запрошенный аватар не найден или уже удален.
-	ErrNotFound = errors.New("not found")
 )
 
 // AvatarService содержит основную бизнес-логику аватаров.
@@ -88,19 +84,26 @@ func (s *AvatarService) Upload(ctx context.Context, in UploadInput) (domain.Avat
 	if err := s.storage.Upload(ctx, key, info.MimeType, avatar.SizeBytes, bytes.NewReader(info.Data)); err != nil {
 		return domain.Avatar{}, err
 	}
-	created, err := s.repo.Create(ctx, avatar)
-	if err != nil {
-		_ = s.storage.Delete(ctx, key)
-		return domain.Avatar{}, err
-	}
 	event := domain.AvatarUploadEvent{
 		MessageID: uuid.NewString(),
-		AvatarID:  created.ID,
-		UserID:    created.UserID,
-		S3Key:     created.S3Key,
+		AvatarID:  avatar.ID,
+		UserID:    avatar.UserID,
+		S3Key:     avatar.S3Key,
+	}
+
+	created, err := s.repo.CreateWithUploadEvent(ctx, avatar, event)
+	if err != nil {
+		if deleteErr := s.storage.Delete(ctx, key); deleteErr != nil {
+			log.Printf("cleanup uploaded object %q after db error: %v", key, deleteErr)
+		}
+		return domain.Avatar{}, err
 	}
 	if err := s.publisher.PublishUpload(ctx, event); err != nil {
-		return domain.Avatar{}, err
+		log.Printf("publish upload event %s failed, event remains in outbox: %v", event.MessageID, err)
+		return created, nil
+	}
+	if err := s.repo.MarkOutboxPublished(ctx, event.MessageID); err != nil {
+		log.Printf("mark outbox message %s published: %v", event.MessageID, err)
 	}
 	return created, nil
 }
@@ -130,28 +133,70 @@ func (s *AvatarService) Metadata(ctx context.Context, id string) (domain.Avatar,
 	return s.repo.GetByID(ctx, id)
 }
 
+// LatestMetadata возвращает последний аватар пользователя без скачивания файла из S3.
+func (s *AvatarService) LatestMetadata(ctx context.Context, userID string) (domain.Avatar, error) {
+	return s.repo.GetLatestByUserID(ctx, userID)
+}
+
 // List возвращает все не удаленные аватары пользователя, начиная с самых новых.
 func (s *AvatarService) List(ctx context.Context, userID string) ([]domain.Avatar, error) {
 	return s.repo.ListByUserID(ctx, userID)
 }
 
-// Delete делает soft delete в базе и публикует событие на удаление файлов из S3.
-func (s *AvatarService) Delete(ctx context.Context, id, userID string) error {
-	avatar, err := s.repo.SoftDelete(ctx, id, userID)
+// PublishOutboxMessage публикует сохраненное в БД событие и помечает его отправленным.
+func (s *AvatarService) PublishOutboxMessage(ctx context.Context, message domain.OutboxMessage) error {
+	switch message.RoutingKey {
+	case "avatar.uploaded":
+		var event domain.AvatarUploadEvent
+		if err := json.Unmarshal(message.Payload, &event); err != nil {
+			return err
+		}
+		if err := s.publisher.PublishUpload(ctx, event); err != nil {
+			return err
+		}
+		return s.repo.MarkOutboxPublished(ctx, message.ID)
+	case "avatar.deleted":
+		var event domain.AvatarDeleteEvent
+		if err := json.Unmarshal(message.Payload, &event); err != nil {
+			return err
+		}
+		if err := s.publisher.PublishDelete(ctx, event); err != nil {
+			return err
+		}
+		return s.repo.MarkOutboxPublished(ctx, message.ID)
+	default:
+		return fmt.Errorf("unknown outbox routing key: %s", message.RoutingKey)
+	}
+}
+
+// FlushOutbox публикует пачку событий, которые остались в outbox после временных ошибок RabbitMQ.
+func (s *AvatarService) FlushOutbox(ctx context.Context, limit int) error {
+	messages, err := s.repo.PendingOutbox(ctx, limit)
 	if err != nil {
 		return err
 	}
-	keys := []string{avatar.S3Key}
-	for _, thumb := range avatar.ThumbnailS3Keys {
-		if thumb.S3Key != "" {
-			keys = append(keys, thumb.S3Key)
+	for _, message := range messages {
+		if err := s.PublishOutboxMessage(ctx, message); err != nil {
+			return err
 		}
 	}
-	return s.publisher.PublishDelete(ctx, domain.AvatarDeleteEvent{
-		MessageID: uuid.NewString(),
-		AvatarID:  avatar.ID,
-		S3Keys:    keys,
-	})
+	return nil
+}
+
+// Delete делает soft delete в базе и публикует событие на удаление файлов из S3.
+func (s *AvatarService) Delete(ctx context.Context, id, userID string) error {
+	_, event, err := s.repo.SoftDeleteWithDeleteEvent(ctx, id, userID, uuid.NewString())
+	if err != nil {
+		return err
+	}
+	if err := s.publisher.PublishDelete(ctx, event); err != nil {
+		log.Printf("publish delete event %s failed, event remains in outbox: %v", event.MessageID, err)
+		return nil
+	}
+	if err := s.repo.MarkOutboxPublished(ctx, event.MessageID); err != nil {
+		log.Printf("mark outbox message %s published: %v", event.MessageID, err)
+	}
+	return nil
 }
 
 func extensionByMime(mimeType, fallback string) string {

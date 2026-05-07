@@ -1,6 +1,17 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var (
+	// ErrForbidden возвращается, когда пользователь пытается изменить чужой аватар.
+	ErrForbidden = errors.New("forbidden")
+
+	// ErrNotFound означает, что запрошенный аватар не найден или уже удален.
+	ErrNotFound = errors.New("not found")
+)
 
 const (
 	// UploadStatusCompleted означает, что оригинальный файл успешно принят и сохранен.
@@ -64,4 +75,12 @@ type AvatarDeleteEvent struct {
 	MessageID string   `json:"message_id"`
 	AvatarID  string   `json:"avatar_id"`
 	S3Keys    []string `json:"s3_keys"`
+}
+
+// OutboxMessage хранит событие, которое уже сохранено в БД, но еще может ожидать публикации в RabbitMQ.
+type OutboxMessage struct {
+	ID         string
+	RoutingKey string
+	Payload    []byte
+	CreatedAt  time.Time
 }

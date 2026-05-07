@@ -59,6 +59,7 @@ services:
     command: ["/app/server"]
     environment:
       HTTP_ADDR: ":8080"
+      PUBLIC_BASE_URL: http://localhost:9000
       DATABASE_URL: postgres://root:root@postgres16:5432/gophprofile
       S3_ENDPOINT: minio:9000
       S3_ACCESS_KEY: admin
@@ -83,6 +84,7 @@ services:
     command: ["/app/worker"]
     environment:
       DATABASE_URL: postgres://root:root@postgres16:5432/gophprofile
+      PUBLIC_BASE_URL: http://localhost:9000
       S3_ENDPOINT: minio:9000
       S3_ACCESS_KEY: admin
       S3_SECRET_KEY: adminadmin

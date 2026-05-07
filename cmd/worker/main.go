@@ -7,17 +7,19 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
+	"gophprofile/internal/app"
 	"gophprofile/internal/config"
-	"gophprofile/internal/queue"
 	"gophprofile/internal/repository"
 	"gophprofile/internal/storage"
 	avatarworker "gophprofile/internal/worker"
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.LoadE()
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -27,12 +29,12 @@ func main() {
 	}
 	defer db.Close()
 
-	s3, err := storage.NewMinIO(ctx, cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Bucket, cfg.S3UseSSL)
+	s3, err := storage.NewMinIO(ctx, cfg.S3Endpoint, cfg.PublicBaseURL, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Bucket, cfg.S3UseSSL)
 	if err != nil {
 		log.Fatalf("connect s3: %v", err)
 	}
 
-	broker, err := connectRabbit(ctx, cfg.RabbitURL, cfg.RabbitExchange, cfg.RabbitQueue)
+	broker, err := app.ConnectRabbit(ctx, cfg.RabbitURL, cfg.RabbitExchange, cfg.RabbitQueue)
 	if err != nil {
 		log.Fatalf("connect rabbitmq: %v", err)
 	}
@@ -43,24 +45,4 @@ func main() {
 	if err := w.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("worker failed: %v", err)
 	}
-}
-
-func connectRabbit(ctx context.Context, url, exchange, queueName string) (*queue.RabbitMQ, error) {
-	var lastErr error
-	for attempt := 1; attempt <= 20; attempt++ {
-		broker, err := queue.NewRabbitMQ(url, exchange, queueName)
-		if err == nil {
-			return broker, nil
-		}
-		lastErr = err
-		log.Printf("connect rabbitmq attempt %d failed: %v", attempt, err)
-		timer := time.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return nil, lastErr
 }

@@ -6,7 +6,6 @@ import (
 	"errors"
 
 	"gophprofile/internal/domain"
-	"gophprofile/internal/services"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -35,13 +34,19 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// Create сохраняет новый аватар и возвращает его с датами, которые выставила база.
-func (r *PostgresRepository) Create(ctx context.Context, avatar domain.Avatar) (domain.Avatar, error) {
+// CreateWithUploadEvent сохраняет новый аватар и outbox-событие в одной транзакции.
+func (r *PostgresRepository) CreateWithUploadEvent(ctx context.Context, avatar domain.Avatar, event domain.AvatarUploadEvent) (domain.Avatar, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return domain.Avatar{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	thumbs, err := json.Marshal(avatar.ThumbnailS3Keys)
 	if err != nil {
 		return domain.Avatar{}, err
 	}
-	err = r.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO avatars (
 			id, user_id, file_name, mime_type, size_bytes, width, height, s3_key,
 			thumbnail_s3_keys, upload_status, processing_status, created_at, updated_at
@@ -52,7 +57,28 @@ func (r *PostgresRepository) Create(ctx context.Context, avatar domain.Avatar) (
 		avatar.Dimensions.Width, avatar.Dimensions.Height, avatar.S3Key, thumbs,
 		avatar.UploadStatus, avatar.ProcessingStatus, avatar.CreatedAt, avatar.UpdatedAt,
 	).Scan(&avatar.CreatedAt, &avatar.UpdatedAt)
-	return avatar, err
+	if err != nil {
+		return domain.Avatar{}, err
+	}
+
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return domain.Avatar{}, err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO outbox_messages(message_id, routing_key, payload)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (message_id) DO NOTHING`,
+		event.MessageID, "avatar.uploaded", payload,
+	)
+	if err != nil {
+		return domain.Avatar{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Avatar{}, err
+	}
+	return avatar, nil
 }
 
 // GetByID ищет не удаленный аватар по идентификатору.
@@ -101,15 +127,77 @@ func (r *PostgresRepository) ListByUserID(ctx context.Context, userID string) ([
 
 // SoftDelete помечает аватар удаленным, но оставляет запись в базе для истории и аудита.
 func (r *PostgresRepository) SoftDelete(ctx context.Context, id, userID string) (domain.Avatar, error) {
-	avatar, err := r.GetByID(ctx, id)
+	return r.softDelete(ctx, id, userID, "")
+}
+
+// SoftDeleteWithDeleteEvent помечает аватар удаленным и сохраняет событие удаления в outbox в той же транзакции.
+func (r *PostgresRepository) SoftDeleteWithDeleteEvent(ctx context.Context, id, userID, messageID string) (domain.Avatar, domain.AvatarDeleteEvent, error) {
+	avatar, err := r.softDelete(ctx, id, userID, messageID)
+	if err != nil {
+		return domain.Avatar{}, domain.AvatarDeleteEvent{}, err
+	}
+	return avatar, domain.AvatarDeleteEvent{MessageID: messageID, AvatarID: avatar.ID, S3Keys: s3Keys(avatar)}, nil
+}
+
+func (r *PostgresRepository) softDelete(ctx context.Context, id, userID, deleteMessageID string) (domain.Avatar, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return domain.Avatar{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	avatar, err := scanAvatar(tx.QueryRow(ctx, `
+		SELECT id, user_id, file_name, mime_type, size_bytes, width, height, s3_key,
+			thumbnail_s3_keys, upload_status, processing_status, created_at, updated_at, deleted_at
+		FROM avatars
+		WHERE id=$1 AND deleted_at IS NULL
+		FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Avatar{}, domain.ErrNotFound
+	}
 	if err != nil {
 		return domain.Avatar{}, err
 	}
 	if avatar.UserID != userID {
-		return domain.Avatar{}, services.ErrForbidden
+		return domain.Avatar{}, domain.ErrForbidden
 	}
-	_, err = r.pool.Exec(ctx, `UPDATE avatars SET deleted_at=NOW(), updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`, id)
-	return avatar, err
+	if _, err = tx.Exec(ctx, `UPDATE avatars SET deleted_at=NOW(), updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`, id); err != nil {
+		return domain.Avatar{}, err
+	}
+	if deleteMessageID != "" {
+		event := domain.AvatarDeleteEvent{
+			MessageID: deleteMessageID,
+			AvatarID:  avatar.ID,
+			S3Keys:    s3Keys(avatar),
+		}
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return domain.Avatar{}, err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbox_messages(message_id, routing_key, payload)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (message_id) DO NOTHING`,
+			event.MessageID, "avatar.deleted", payload,
+		)
+		if err != nil {
+			return domain.Avatar{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Avatar{}, err
+	}
+	return avatar, nil
+}
+
+func s3Keys(avatar domain.Avatar) []string {
+	keys := []string{avatar.S3Key}
+	for _, thumb := range avatar.ThumbnailS3Keys {
+		if thumb.S3Key != "" {
+			keys = append(keys, thumb.S3Key)
+		}
+	}
+	return keys
 }
 
 // MarkProcessing пытается взять аватар в обработку и защищает worker от двойной работы.
@@ -157,6 +245,36 @@ func (r *PostgresRepository) SaveProcessedMessage(ctx context.Context, messageID
 	return err
 }
 
+// MarkOutboxPublished помечает outbox-сообщение опубликованным.
+func (r *PostgresRepository) MarkOutboxPublished(ctx context.Context, messageID string) error {
+	_, err := r.pool.Exec(ctx, `UPDATE outbox_messages SET published_at=NOW() WHERE message_id=$1`, messageID)
+	return err
+}
+
+// PendingOutbox возвращает неопубликованные outbox-сообщения от старых к новым.
+func (r *PostgresRepository) PendingOutbox(ctx context.Context, limit int) ([]domain.OutboxMessage, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT message_id, routing_key, payload, created_at
+		FROM outbox_messages
+		WHERE published_at IS NULL
+		ORDER BY created_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []domain.OutboxMessage
+	for rows.Next() {
+		var message domain.OutboxMessage
+		if err := rows.Scan(&message.ID, &message.RoutingKey, &message.Payload, &message.CreatedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
 // Ping проверяет, что PostgreSQL доступен.
 func (r *PostgresRepository) Ping(ctx context.Context) error {
 	return r.pool.Ping(ctx)
@@ -165,7 +283,7 @@ func (r *PostgresRepository) Ping(ctx context.Context) error {
 func (r *PostgresRepository) scanOne(ctx context.Context, query string, args ...any) (domain.Avatar, error) {
 	avatar, err := scanAvatar(r.pool.QueryRow(ctx, query, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Avatar{}, services.ErrNotFound
+		return domain.Avatar{}, domain.ErrNotFound
 	}
 	return avatar, err
 }

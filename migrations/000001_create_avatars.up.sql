@@ -25,3 +25,13 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     message_id UUID PRIMARY KEY,
     processed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS outbox_messages (
+    message_id UUID PRIMARY KEY,
+    routing_key VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_messages_unpublished ON outbox_messages(created_at) WHERE published_at IS NULL;

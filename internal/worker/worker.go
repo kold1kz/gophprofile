@@ -19,20 +19,48 @@ import (
 type Worker struct {
 	repo    services.AvatarRepository
 	storage services.ObjectStorage
-	events  *queue.RabbitMQ
+	events  eventConsumer
 }
+
+type eventConsumer interface {
+	Consume() (<-chan amqp.Delivery, error)
+}
+
+var (
+	decodeImage = imaging.Decode
+	resizeJPEG  = imaging.ResizeJPEG
+)
 
 // New создает worker с репозиторием, объектным хранилищем и очередью событий.
 func New(repo services.AvatarRepository, storage services.ObjectStorage, events *queue.RabbitMQ) *Worker {
+	if events == nil {
+		return &Worker{repo: repo, storage: storage}
+	}
 	return &Worker{repo: repo, storage: storage, events: events}
 }
 
 // Run запускает цикл чтения сообщений и останавливается, когда закрыт контекст или очередь.
 func (w *Worker) Run(ctx context.Context) error {
-	deliveries, err := w.events.Consume()
-	if err != nil {
-		return err
+	for {
+		deliveries, err := w.events.Consume()
+		if err != nil {
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+				continue
+			}
+		}
+
+		if err := w.consume(ctx, deliveries); err != nil {
+			return err
+		}
 	}
+}
+
+func (w *Worker) consume(ctx context.Context, deliveries <-chan amqp.Delivery) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -97,14 +125,18 @@ func (w *Worker) HandleUploadEvent(ctx context.Context, event domain.AvatarUploa
 
 	body, _, err := w.storage.Download(ctx, event.S3Key)
 	if err != nil {
-		_ = w.repo.UpdateProcessingFailed(ctx, event.AvatarID)
+		if markErr := w.repo.UpdateProcessingFailed(ctx, event.AvatarID); markErr != nil {
+			return fmt.Errorf("download original: %w; mark failed: %v", err, markErr)
+		}
 		return err
 	}
 	defer body.Close()
 
-	info, err := imaging.Decode(body)
+	info, err := decodeImage(body)
 	if err != nil {
-		_ = w.repo.UpdateProcessingFailed(ctx, event.AvatarID)
+		if markErr := w.repo.UpdateProcessingFailed(ctx, event.AvatarID); markErr != nil {
+			return fmt.Errorf("decode original: %w; mark failed: %v", err, markErr)
+		}
 		return err
 	}
 
@@ -118,17 +150,27 @@ func (w *Worker) HandleUploadEvent(ctx context.Context, event domain.AvatarUploa
 	}
 	thumbnails := make([]domain.Thumbnail, 0, len(sizes))
 	for _, size := range sizes {
-		data, err := imaging.ResizeJPEG(info.Image, size.width, size.height)
+		data, err := resizeJPEG(info.Image, size.width, size.height)
 		if err != nil {
-			_ = w.repo.UpdateProcessingFailed(ctx, event.AvatarID)
+			if markErr := w.repo.UpdateProcessingFailed(ctx, event.AvatarID); markErr != nil {
+				return fmt.Errorf("resize thumbnail: %w; mark failed: %v", err, markErr)
+			}
 			return err
 		}
 		key := fmt.Sprintf("thumbnails/%s/%s.jpg", event.AvatarID, size.name)
-		if err := w.storage.Upload(ctx, key, "image/jpeg", int64(len(data)), bytesReader(data)); err != nil {
-			_ = w.repo.UpdateProcessingFailed(ctx, event.AvatarID)
+		if err := w.storage.Upload(ctx, key, "image/jpeg", int64(len(data)), bytes.NewReader(data)); err != nil {
+			if markErr := w.repo.UpdateProcessingFailed(ctx, event.AvatarID); markErr != nil {
+				return fmt.Errorf("upload thumbnail: %w; mark failed: %v", err, markErr)
+			}
 			return err
 		}
-		url, _ := w.storage.PresignedGetURL(ctx, key)
+		url, err := w.storage.PresignedGetURL(ctx, key)
+		if err != nil {
+			if markErr := w.repo.UpdateProcessingFailed(ctx, event.AvatarID); markErr != nil {
+				return fmt.Errorf("presign thumbnail: %w; mark failed: %v", err, markErr)
+			}
+			return err
+		}
 		thumbnails = append(thumbnails, domain.Thumbnail{Size: size.name, S3Key: key, URL: url})
 	}
 	if err := w.repo.UpdateProcessed(ctx, event.AvatarID, thumbnails); err != nil {
@@ -182,8 +224,4 @@ func retry(ctx context.Context, attempts int, fn func() error) error {
 		delay *= 2
 	}
 	return err
-}
-
-func bytesReader(data []byte) *bytes.Reader {
-	return bytes.NewReader(data)
 }

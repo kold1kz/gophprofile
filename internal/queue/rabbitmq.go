@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"sync"
 	"time"
 
 	"gophprofile/internal/domain"
@@ -24,10 +26,15 @@ const (
 
 // RabbitMQ инкапсулирует подключение к брокеру, exchange, рабочую очередь и DLQ.
 type RabbitMQ struct {
+	mu         sync.RWMutex
+	publishMu  sync.Mutex
+	url        string
 	conn       *amqp.Connection
-	channel    *amqp.Channel
+	publishCh  *amqp.Channel
+	consumeCh  *amqp.Channel
 	confirms   <-chan amqp.Confirmation
 	returns    <-chan amqp.Return
+	closeCh    <-chan *amqp.Error
 	exchange   string
 	queue      string
 	dlx        string
@@ -36,65 +43,99 @@ type RabbitMQ struct {
 
 // NewRabbitMQ подключается к RabbitMQ и объявляет все сущности, нужные для надежной доставки.
 func NewRabbitMQ(url, exchange, queue string) (*RabbitMQ, error) {
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		return nil, err
-	}
-	ch, err := conn.Channel()
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
 	r := &RabbitMQ{
-		conn:       conn,
-		channel:    ch,
+		url:        url,
 		exchange:   exchange,
 		queue:      queue,
 		dlx:        exchange + ".dlx",
 		deadLetter: queue + ".dlq",
 	}
-	if err := r.declare(); err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
+	if err := r.connect(); err != nil {
 		return nil, err
 	}
-	if err := ch.Confirm(false); err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil, err
-	}
-	r.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
-	r.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
+	go r.reconnectOnClose()
 	return r, nil
 }
 
-func (r *RabbitMQ) declare() error {
-	if err := r.channel.ExchangeDeclare(r.exchange, "topic", true, false, false, false, nil); err != nil {
-		return err
-	}
-	if err := r.channel.ExchangeDeclare(r.dlx, "topic", true, false, false, false, nil); err != nil {
-		return err
-	}
-	_, err := r.channel.QueueDeclare(r.deadLetter, true, false, false, false, nil)
+func (r *RabbitMQ) connect() error {
+	conn, err := amqp.Dial(r.url)
 	if err != nil {
 		return err
 	}
-	if err := r.channel.QueueBind(r.deadLetter, "#", r.dlx, false, nil); err != nil {
+	publishCh, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	consumeCh, err := conn.Channel()
+	if err != nil {
+		_ = publishCh.Close()
+		_ = conn.Close()
 		return err
 	}
 
-	_, err = r.channel.QueueDeclare(r.queue, true, false, false, false, amqp.Table{
+	r.mu.Lock()
+	oldConn := r.conn
+	oldPublishCh := r.publishCh
+	oldConsumeCh := r.consumeCh
+	r.conn = conn
+	r.publishCh = publishCh
+	r.consumeCh = consumeCh
+	r.closeCh = conn.NotifyClose(make(chan *amqp.Error, 1))
+	r.mu.Unlock()
+
+	if oldPublishCh != nil {
+		_ = oldPublishCh.Close()
+	}
+	if oldConsumeCh != nil {
+		_ = oldConsumeCh.Close()
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+
+	if err := r.declare(); err != nil {
+		return err
+	}
+	if err := publishCh.Confirm(false); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	r.confirms = publishCh.NotifyPublish(make(chan amqp.Confirmation, 1))
+	r.returns = publishCh.NotifyReturn(make(chan amqp.Return, 1))
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *RabbitMQ) declare() error {
+	r.mu.RLock()
+	ch := r.consumeCh
+	r.mu.RUnlock()
+
+	if err := ch.ExchangeDeclare(r.exchange, "topic", true, false, false, false, nil); err != nil {
+		return err
+	}
+	if err := ch.ExchangeDeclare(r.dlx, "topic", true, false, false, false, nil); err != nil {
+		return err
+	}
+	if _, err := ch.QueueDeclare(r.deadLetter, true, false, false, false, nil); err != nil {
+		return err
+	}
+	if err := ch.QueueBind(r.deadLetter, "#", r.dlx, false, nil); err != nil {
+		return err
+	}
+	if _, err := ch.QueueDeclare(r.queue, true, false, false, false, amqp.Table{
 		"x-dead-letter-exchange": r.dlx,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	for _, key := range []string{RoutingAvatarUploaded, RoutingAvatarDeleted} {
-		if err := r.channel.QueueBind(r.queue, key, r.exchange, false, nil); err != nil {
+		if err := ch.QueueBind(r.queue, key, r.exchange, false, nil); err != nil {
 			return err
 		}
 	}
-	return r.channel.Qos(1, 0, false)
+	return ch.Qos(1, 0, false)
 }
 
 // PublishUpload публикует событие о новой загрузке и ждет confirm от брокера.
@@ -109,7 +150,10 @@ func (r *RabbitMQ) PublishDelete(ctx context.Context, event domain.AvatarDeleteE
 
 // Consume подписывает worker на очередь в режиме manual ack.
 func (r *RabbitMQ) Consume() (<-chan amqp.Delivery, error) {
-	return r.channel.Consume(r.queue, "", false, false, false, false, nil)
+	r.mu.RLock()
+	ch := r.consumeCh
+	r.mu.RUnlock()
+	return ch.Consume(r.queue, "", false, false, false, false, nil)
 }
 
 // Ping проверяет, что exchange существует и канал RabbitMQ жив.
@@ -119,13 +163,21 @@ func (r *RabbitMQ) Ping(ctx context.Context) error {
 		return ctx.Err()
 	default:
 	}
-	return r.channel.ExchangeDeclarePassive(r.exchange, "topic", true, false, false, false, nil)
+	r.mu.RLock()
+	ch := r.consumeCh
+	r.mu.RUnlock()
+	return ch.ExchangeDeclarePassive(r.exchange, "topic", true, false, false, false, nil)
 }
 
-// Close закрывает канал и соединение с RabbitMQ.
+// Close закрывает каналы и соединение с RabbitMQ.
 func (r *RabbitMQ) Close() error {
-	if r.channel != nil {
-		_ = r.channel.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.publishCh != nil {
+		_ = r.publishCh.Close()
+	}
+	if r.consumeCh != nil {
+		_ = r.consumeCh.Close()
 	}
 	if r.conn != nil {
 		return r.conn.Close()
@@ -134,6 +186,9 @@ func (r *RabbitMQ) Close() error {
 }
 
 func (r *RabbitMQ) publish(ctx context.Context, routingKey, messageID string, payload any) error {
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -142,7 +197,13 @@ func (r *RabbitMQ) publish(ctx context.Context, routingKey, messageID string, pa
 	ctx, cancel := context.WithTimeout(ctx, confirmTimeout)
 	defer cancel()
 
-	if err := r.channel.PublishWithContext(ctx, r.exchange, routingKey, true, false, amqp.Publishing{
+	r.mu.RLock()
+	ch := r.publishCh
+	confirms := r.confirms
+	returns := r.returns
+	r.mu.RUnlock()
+
+	if err := ch.PublishWithContext(ctx, r.exchange, routingKey, true, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    messageID,
@@ -153,14 +214,43 @@ func (r *RabbitMQ) publish(ctx context.Context, routingKey, messageID string, pa
 	}
 
 	select {
-	case ret := <-r.returns:
+	case ret := <-returns:
 		return fmt.Errorf("rabbitmq returned message %q: %s", ret.RoutingKey, ret.ReplyText)
-	case confirmation := <-r.confirms:
+	case confirmation := <-confirms:
 		if confirmation.Ack {
 			return nil
 		}
 		return errors.New("rabbitmq rejected publish")
 	case <-ctx.Done():
 		return fmt.Errorf("rabbitmq publish confirm timeout: %w", ctx.Err())
+	}
+}
+
+func (r *RabbitMQ) reconnectOnClose() {
+	for {
+		r.mu.RLock()
+		closeCh := r.closeCh
+		r.mu.RUnlock()
+
+		err, ok := <-closeCh
+		if !ok {
+			return
+		}
+		if err != nil {
+			log.Printf("rabbitmq connection closed: %v", err)
+		}
+
+		delay := time.Second
+		for {
+			if err := r.connect(); err == nil {
+				log.Printf("rabbitmq connection restored")
+				break
+			}
+			time.Sleep(delay)
+			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
 	}
 }

@@ -10,8 +10,8 @@ import (
 // AvatarRepository описывает операции с метаданными аватаров.
 // Сервису не важно, где они хранятся, пока реализация соблюдает этот контракт.
 type AvatarRepository interface {
-	// Create сохраняет метаданные нового аватара.
-	Create(ctx context.Context, avatar domain.Avatar) (domain.Avatar, error)
+	// CreateWithUploadEvent сохраняет аватар и событие загрузки в одной транзакции.
+	CreateWithUploadEvent(ctx context.Context, avatar domain.Avatar, event domain.AvatarUploadEvent) (domain.Avatar, error)
 	// GetByID возвращает один активный аватар по ID.
 	GetByID(ctx context.Context, id string) (domain.Avatar, error)
 	// GetLatestByUserID возвращает самый свежий активный аватар пользователя.
@@ -20,6 +20,8 @@ type AvatarRepository interface {
 	ListByUserID(ctx context.Context, userID string) ([]domain.Avatar, error)
 	// SoftDelete помечает аватар удаленным и проверяет владельца.
 	SoftDelete(ctx context.Context, id, userID string) (domain.Avatar, error)
+	// SoftDeleteWithDeleteEvent помечает аватар удаленным и сохраняет событие удаления в outbox.
+	SoftDeleteWithDeleteEvent(ctx context.Context, id, userID, messageID string) (domain.Avatar, domain.AvatarDeleteEvent, error)
 	// MarkProcessing пытается перевести аватар в статус processing.
 	MarkProcessing(ctx context.Context, id string) (bool, error)
 	// UpdateProcessed сохраняет результат успешной обработки.
@@ -30,6 +32,10 @@ type AvatarRepository interface {
 	ProcessedMessage(ctx context.Context, messageID string) (bool, error)
 	// SaveProcessedMessage запоминает успешно обработанное событие.
 	SaveProcessedMessage(ctx context.Context, messageID string) error
+	// MarkOutboxPublished помечает outbox-событие опубликованным.
+	MarkOutboxPublished(ctx context.Context, messageID string) error
+	// PendingOutbox возвращает неопубликованные outbox-сообщения.
+	PendingOutbox(ctx context.Context, limit int) ([]domain.OutboxMessage, error)
 	// Ping проверяет доступность хранилища метаданных.
 	Ping(ctx context.Context) error
 }
