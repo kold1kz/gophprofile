@@ -1,0 +1,109 @@
+services:
+  postgres:
+    container_name: postgres16
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gophprofile
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: root
+    ports:
+      - "15432:5432"
+    networks:
+      - gophprofile_network
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/000001_create_avatars.up.sql:/docker-entrypoint-initdb.d/000001_create_avatars.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d gophprofile"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    container_name: rabbitmq
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - gophprofile_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    container_name: minio
+    image: minio/minio:RELEASE.2024-03-30T09-41-56Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: adminadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    networks:
+      - gophprofile_network
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  server:
+    container_name: server
+    build: .
+    command: ["/app/server"]
+    environment:
+      HTTP_ADDR: ":8080"
+      PUBLIC_BASE_URL: http://localhost:9000
+      DATABASE_URL: postgres://root:root@postgres16:5432/gophprofile
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: admin
+      S3_SECRET_KEY: adminadmin
+      S3_BUCKET: avatars
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    ports:
+      - "8080:8080"
+    networks:
+      - gophprofile_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  worker:
+    container_name: worker
+    build: .
+    command: ["/app/worker"]
+    environment:
+      DATABASE_URL: postgres://root:root@postgres16:5432/gophprofile
+      PUBLIC_BASE_URL: http://localhost:9000
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: admin
+      S3_SECRET_KEY: adminadmin
+      S3_BUCKET: avatars
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    networks:
+      - gophprofile_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+networks:
+  gophprofile_network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  miniodata:

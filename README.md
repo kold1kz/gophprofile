@@ -15,7 +15,7 @@ docker compose up --build
 - Health: `http://localhost:8080/health`
 - PostgreSQL: `localhost:15432`
 - RabbitMQ UI: `http://localhost:15672` (`guest` / `guest`)
-- MinIO UI: `http://localhost:9001` (`minioadmin` / `minioadmin`)
+- MinIO UI: `http://localhost:9001` (`admin` / `adminadmin`)
 
 ## Основные эндпоинты
 
@@ -23,4 +23,5 @@ docker compose up --build
 curl -F file=@avatar.jpg -H 'X-User-ID: user-1' http://localhost:8080/api/v1/avatars
 curl http://localhost:8080/api/v1/users/user-1/avatars
 curl http://localhost:8080/api/v1/users/user-1/avatar --output avatar.jpg
+curl -X DELETE -H 'X-User-ID: user-1' http://localhost:8080/api/v1/avatars/<avatar_id>
 ```
